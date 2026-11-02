@@ -1,0 +1,42 @@
+name: File or update an issue
+description: >-
+  Opens one issue per title, or comments on it if it is already open, so a
+  failing scheduled check is seen without opening a new issue every run.
+  Needs `issues: write`. Give each workflow that uses it a concurrency group
+  (the template's workflows have one), so two runs can't both open an issue.
+inputs:
+  title:
+    description: Exact issue title. One open issue per title.
+    required: true
+  body-file:
+    description: Markdown file with the body.
+    required: true
+  label:
+    description: Label the issues carry, created if missing.
+    default: ci-alert
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TITLE: ${{ inputs.title }}
+        BODY: ${{ inputs.body-file }}
+        LABEL: ${{ inputs.label }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        printf '\n\nRun: %s\n' "$RUN_URL" >> "$BODY"
+        gh label create "$LABEL" --color B60205 --description "Filed by CI" 2>/dev/null || true
+        # The REST issues list, not `gh issue list --label`: that goes through
+        # the search API, which can miss an issue filed seconds ago and so open
+        # a duplicate. The list includes pull requests; keep issues only.
+        number=$(gh api --paginate -X GET "repos/${GITHUB_REPOSITORY}/issues" \
+            -f state=open -f labels="$LABEL" -f per_page=100 \
+          | jq -rn --arg t "$TITLE" \
+            '[inputs | .[] | select(.pull_request == null and .title == $t) | .number] | first // empty')
+        if [ -n "$number" ]; then
+          gh issue comment "$number" --body-file "$BODY"
+        else
+          gh issue create --title "$TITLE" --label "$LABEL" --body-file "$BODY"
+        fi

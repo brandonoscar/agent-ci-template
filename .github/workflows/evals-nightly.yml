@@ -1,0 +1,118 @@
+# The trend signal: runs the whole suite three times and files one issue with
+# the cases that are failing, flaky, never reached, or drifting from their
+# baseline wording (evals/baseline.json; refresh it with
+# `agent-eval track ... --update-baseline` after reading the new wording).
+# Gates nothing. Same switch as evals.yml: EVALS_ENABLED=true.
+#
+# A night that could not run (no EVALS_TARGET, a failed install, a run that
+# crashed before writing its results) files its own issue: nothing tracked is
+# not the same as nothing found.
+#
+# GitHub runs schedules from the default branch only, so this does nothing
+# until it is on main.
+name: Evals (nightly)
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals-nightly
+  cancel-in-progress: false
+
+jobs:
+  track:
+    if: vars.EVALS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install -e . "agent-eval-harness @ git+https://github.com/brandonoscar/agent-eval-harness@v0.1.0"
+      - name: Run the suite three times
+        id: runs
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CASES: ${{ vars.EVALS_CASES || 'evals/cases' }}
+          TARGET: ${{ vars.EVALS_TARGET }}
+        run: |
+          # No -e: a run that fails is recorded below, and the other runs still go.
+          set +e -uo pipefail
+          if [ -z "$TARGET" ]; then
+            echo "EVALS_TARGET is not set: the nightly run cannot run, and that is not a pass." \
+              | tee could-not-run.txt
+            exit 1
+          fi
+          mkdir -p runs
+          : > could-not-run.txt
+          for i in 1 2 3; do
+            # Exit 1 is a failed gate: its results are in the JSON, and the
+            # tracker reads them. No JSON means the run itself broke.
+            agent-eval run --cases "$CASES" --target "$TARGET" --reroll-quarantined \
+              --json "runs/run-$i.json" 2>&1 | tee "runs/run-$i.log"
+            code=${PIPESTATUS[0]}
+            if [ ! -s "runs/run-$i.json" ]; then
+              {
+                echo "Run $i of 3 stopped without writing its results (exit $code). Its last lines:"
+                tail -n 20 "runs/run-$i.log"
+                echo ""
+              } >> could-not-run.txt
+            fi
+          done
+          if [ -s could-not-run.txt ]; then exit 1; fi
+      - name: Track
+        id: track
+        env:
+          CASES: ${{ vars.EVALS_CASES || 'evals/cases' }}
+        run: |
+          set -o pipefail
+          agent-eval track runs/run-1.json runs/run-2.json runs/run-3.json --cases "$CASES" \
+            --baseline evals/baseline.json --markdown report.md --json findings.json 2>&1 \
+            | tee track.log
+          # Count findings from the JSON, not by matching the report's wording.
+          count=$(jq 'length' findings.json)
+          if [ "$count" -gt 0 ]; then echo "found=true" >> "$GITHUB_OUTPUT"
+          else echo "found=false" >> "$GITHUB_OUTPUT"; fi
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+      - name: File the findings
+        id: findings
+        if: steps.track.outputs.found == 'true'
+        uses: ./.github/actions/file-issue
+        with:
+          title: "[evals] nightly tracker findings"
+          body-file: report.md
+      - name: Write the could-not-run issue
+        if: failure() && steps.findings.outcome != 'failure'
+        run: |
+          {
+            echo "The nightly eval run did not finish, so nothing was tracked tonight. Nothing"
+            echo "tracked is not the same as nothing found."
+            echo ""
+            echo '```'
+            if [ -s could-not-run.txt ]; then cat could-not-run.txt
+            elif [ -s track.log ]; then tail -n 40 track.log
+            else echo "(no output: the run log says which step failed)"
+            fi
+            echo '```'
+          } > issue.md
+      - if: failure() && steps.findings.outcome != 'failure'
+        uses: ./.github/actions/file-issue
+        with:
+          title: "[evals] the nightly eval run did not finish"
+          body-file: issue.md
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: eval-runs
+          path: runs/
+          if-no-files-found: ignore

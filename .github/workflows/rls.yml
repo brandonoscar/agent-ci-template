@@ -1,0 +1,85 @@
+# Multi-tenant database guards (supabase-rls-guard). Turn on with the
+# repository variable RLS_ENABLED=true and commit an rls-guard.toml.
+#
+# Pull requests and pushes: the static checks (every table has RLS, every view
+# is security_invoker and revokes anon/authenticated, every tenant query names
+# the tenant column). Weekly: the same questions asked of the live catalog,
+# with the DATABASE_URL secret. A missing secret is not a pass: it files an
+# issue like any finding.
+name: RLS guard
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 13 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rls-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  static:
+    if: vars.RLS_ENABLED == 'true' && github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: brandonoscar/supabase-rls-guard@v0.1.0
+        with:
+          config: rls-guard.toml
+
+  live:
+    if: vars.RLS_ENABLED == 'true' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install "supabase-rls-guard[live] @ git+https://github.com/brandonoscar/supabase-rls-guard@v0.1.0"
+      - name: Live checks
+        id: live
+        env:
+          RLS_GUARD_DSN: ${{ secrets.DATABASE_URL }}
+        run: |
+          set +e
+          rls-guard live --config rls-guard.toml 2>&1 | tee live.txt
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: Write the issue
+        if: failure()
+        env:
+          CODE: ${{ steps.live.outputs.code }}
+        run: |
+          case "$CODE" in
+            1) echo "The live database has a table or view that exposes rows across tenants:" > issue.md ;;
+            2) {
+                 echo "The live RLS check could not run (no DATABASE_URL secret, the database was"
+                 echo "unreachable, or the config could not be read). A check that did not run is not"
+                 echo "one that passed."
+               } > issue.md ;;
+            *) {
+                 echo "The live RLS check did not start: a step before it failed (checkout, Python or"
+                 echo "the install). The run log says which. A check that did not run is not one that"
+                 echo "passed."
+               } > issue.md ;;
+          esac
+          if [ -s live.txt ]; then
+            printf '\n```\n' >> issue.md; cat live.txt >> issue.md; printf '```\n' >> issue.md
+          fi
+      - if: failure()
+        uses: ./.github/actions/file-issue
+        with:
+          title: "[rls] the live tenant-isolation check failed"
+          body-file: issue.md

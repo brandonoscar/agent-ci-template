@@ -1,0 +1,82 @@
+# The eval gate (agent-eval-harness). Safety failures block the merge; quality
+# misses on model-driven cases do not. Turn it on with the repository variable
+# EVALS_ENABLED=true, and set EVALS_TARGET (module:function that runs one case),
+# EVALS_CASES (default evals/cases) and EVALS_AGENT_GLOB (comma-separated paths
+# that count as agent code; the default is below). Put your model provider's
+# key in a secret.
+#
+# On a pull request it runs the deterministic cases and the cases whose own
+# files changed. Only when agent code changed (a path matching EVALS_AGENT_GLOB)
+# does it also run every tier-1 safety case and a rotating slice of the other
+# safety cases, picked by the commit SHA; a pull request that touches no agent
+# code runs no model-driven safety case. On a push to main it runs every case,
+# so no case reaches main unrun.
+name: Evals
+
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: evals-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    if: vars.EVALS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: pip install -e . "agent-eval-harness @ git+https://github.com/brandonoscar/agent-eval-harness@v0.1.0"
+      - name: List the changed files
+        if: github.event_name == 'pull_request'
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        # Three dots: what this pull request changed since it branched off, not
+        # every commit main gained since.
+        run: git diff --name-only "$BASE...$HEAD" > changed.txt
+      - name: Run the gate
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          CASES: ${{ vars.EVALS_CASES || 'evals/cases' }}
+          TARGET: ${{ vars.EVALS_TARGET }}
+          # Model SDK bumps and prompt edits change the agent as much as code does.
+          AGENT_GLOB: ${{ vars.EVALS_AGENT_GLOB || 'src/*,prompts/*,pyproject.toml,*.lock,requirements*.txt' }}
+          SEED: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$TARGET" ]; then
+            echo "EVALS_TARGET is not set: the gate cannot run, and that is not a pass."
+            exit 1
+          fi
+          args=(--cases "$CASES" --target "$TARGET" --json results.json)
+          if [ -n "$SEED" ]; then
+            args+=(--pr-gate --changed-files changed.txt --rotate-seed "$SEED")
+            # One --agent-glob per comma-separated pattern; the harness takes
+            # each flag as one pattern.
+            IFS=',' read -r -a globs <<< "$AGENT_GLOB"
+            for glob in "${globs[@]}"; do
+              glob="${glob//[[:space:]]/}"
+              if [ -n "$glob" ]; then args+=(--agent-glob "$glob"); fi
+            done
+          fi
+          agent-eval run "${args[@]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: eval-results
+          path: results.json
+          if-no-files-found: ignore

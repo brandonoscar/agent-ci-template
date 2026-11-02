@@ -1,0 +1,13 @@
+# gitleaks configuration: the default rules, plus an allowlist for things that
+# look like secrets and are not (test fixtures, documented placeholders).
+# Keep the allowlist narrow and say why for each entry.
+title = "gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known non-secrets"
+paths = [
+  # '''tests/fixtures/fake_keys\.json''',  # synthetic keys used by the tests
+]

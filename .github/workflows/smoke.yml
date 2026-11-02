@@ -1,0 +1,102 @@
+# Post-deploy smoke tests: is the deployed app up, answering correctly, and
+# fast enough? Turn on with SMOKE_ENABLED=true and set SMOKE_BASE_URL (a
+# repository variable). Runs after each successful deployment your host reports
+# to GitHub for an environment in SMOKE_ENVIRONMENTS (default "production"),
+# every six hours against SMOKE_BASE_URL, and by hand. A failure, or a run that
+# could not check anything, files one issue.
+name: Smoke
+
+on:
+  deployment_status: {}
+  schedule:
+    - cron: "11 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke
+  cancel-in-progress: false
+
+jobs:
+  smoke:
+    if: >-
+      vars.SMOKE_ENABLED == 'true' &&
+      (github.event_name != 'deployment_status' || github.event.deployment_status.state == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      # The default branch's checks and script, never the deployed commit's:
+      # this job can file issues, so it runs only code that is already merged.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Pick the URL
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          DEPLOY_ENV: ${{ github.event.deployment.environment }}
+          DEPLOY_URL: ${{ github.event.deployment_status.environment_url }}
+          WANTED: ${{ vars.SMOKE_ENVIRONMENTS || 'production' }}
+          BASE_URL: ${{ vars.SMOKE_BASE_URL }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "deployment_status" ]; then
+            # An empty SMOKE_BASE_URL reaches smoke.py, which says it could not run.
+            printf 'url=%s\n' "${BASE_URL//[$'\r\n']/}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          wanted=",$(printf '%s' "$WANTED" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'),"
+          env_name=$(printf '%s' "$DEPLOY_ENV" | tr '[:upper:]' '[:lower:]')
+          if [[ "$wanted" != *",$env_name,"* ]]; then
+            echo "The deployment to '$DEPLOY_ENV' is not in SMOKE_ENVIRONMENTS ($WANTED): not smoke-tested."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$DEPLOY_URL" ] || [[ "$DEPLOY_URL" =~ [[:space:]] ]]; then
+            # Falling back to SMOKE_BASE_URL here would test production and
+            # call it this deployment.
+            echo "smoke: could not run: the deployment to '$DEPLOY_ENV' reported no usable URL ('$DEPLOY_URL'). Not a pass." \
+              | tee smoke.txt
+            exit 1
+          fi
+          printf 'url=%s\n' "$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+      - name: Run the smoke checks
+        id: smoke
+        if: steps.target.outputs.skip != 'true'
+        env:
+          SMOKE_BASE_URL: ${{ steps.target.outputs.url }}
+        # 2>&1 | tee keeps "could not run" (stderr) for the issue; PIPESTATUS
+        # keeps smoke.py's exit code, not tee's.
+        run: |
+          set +e
+          python scripts/smoke.py --checks smoke/checks.json 2>&1 | tee smoke.txt
+          code=${PIPESTATUS[0]}
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+      - name: Write the issue
+        if: failure()
+        env:
+          CODE: ${{ steps.smoke.outputs.code }}
+        run: |
+          if [ "$CODE" = "1" ]; then
+            echo "The smoke checks failed against the deployed app:" > issue.md
+          else
+            echo "The smoke checks could not run, so nothing was checked. That is not a pass:" > issue.md
+          fi
+          echo "" >> issue.md
+          if [ -s smoke.txt ]; then cat smoke.txt >> issue.md
+          else echo "(no output: the run log says which step failed)" >> issue.md
+          fi
+      - if: failure()
+        uses: ./.github/actions/file-issue
+        with:
+          title: "[smoke] the smoke checks failed"
+          body-file: issue.md

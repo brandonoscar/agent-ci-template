@@ -1,0 +1,102 @@
+# A scheduled check that stops running looks exactly like one that passes.
+# This files an issue when a scheduled workflow has no successful *scheduled*
+# run within its allowed age: disabled by hand, a cron edited away, a job whose
+# condition now skips it. Pull request and push runs don't count; they say
+# nothing about whether the schedule still fires.
+#
+# It can't see GitHub stopping every schedule at once (in a public repository
+# after 60 days without activity, or on a billing problem): this workflow is a
+# schedule too. For that, set the LIVENESS_HEARTBEAT_URL secret to the ping
+# URL of an outside dead-man's-switch monitor; each run pings it, and the
+# monitor alerts when the pings stop.
+#
+# Turn on with LIVENESS_ENABLED=true; list what to watch in LIVENESS_MAX_AGE,
+# e.g. "secrets.yml=8d,evals-nightly.yml=2d,rls.yml=8d,smoke.yml=1d".
+name: Liveness
+
+on:
+  schedule:
+    - cron: "7 */6 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: liveness
+  cancel-in-progress: false
+
+jobs:
+  liveness:
+    if: vars.LIVENESS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Collect each workflow's last successful scheduled run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MAX_AGE: ${{ vars.LIVENESS_MAX_AGE || 'secrets.yml=8d' }}
+        run: |
+          set -euo pipefail
+          echo '{}' > last_runs.json
+          for item in ${MAX_AGE//,/ }; do
+            wf="${item%%=*}"
+            # A lookup that fails (a typo, an API error) is recorded as an
+            # error, which liveness.py reports; it never reads as "never ran".
+            if ts=$(gh run list --workflow "$wf" --event schedule --status success --limit 1 \
+                --json createdAt --jq '.[0].createdAt // empty' 2>gh-error.txt); then
+              jq --arg k "$wf" --arg v "$ts" '. + {($k): (if $v == "" then null else $v end)}' \
+                last_runs.json > tmp.json
+            else
+              jq --arg k "$wf" --rawfile e gh-error.txt '. + {($k): {error: ($e | gsub("\\s+"; " "))}}' \
+                last_runs.json > tmp.json
+            fi
+            mv tmp.json last_runs.json
+          done
+          cat last_runs.json
+      - name: Check
+        id: check
+        env:
+          MAX_AGE: ${{ vars.LIVENESS_MAX_AGE || 'secrets.yml=8d' }}
+        # 2>&1: a "could not run" message goes to stderr, and the issue needs it.
+        run: |
+          set -o pipefail
+          python scripts/liveness.py --last-runs last_runs.json --max-age "$MAX_AGE" 2>&1 \
+            | tee liveness.txt
+      - name: Write the issue
+        if: failure()
+        run: |
+          {
+            echo "A scheduled workflow has not succeeded on schedule within its allowed age, or"
+            echo "liveness could not check it:"
+            echo ""
+            if [ -s liveness.txt ]; then cat liveness.txt
+            else echo "(liveness did not get as far as checking; the run log says which step failed)"
+            fi
+          } > issue.md
+      - if: failure()
+        uses: ./.github/actions/file-issue
+        with:
+          title: "[liveness] a scheduled workflow stopped running"
+          body-file: issue.md
+      - name: Ping the outside heartbeat
+        # Liveness itself ran (whatever it found), so tell the outside monitor.
+        if: always() && (steps.check.outcome == 'success' || steps.check.outcome == 'failure')
+        env:
+          HEARTBEAT_URL: ${{ secrets.LIVENESS_HEARTBEAT_URL }}
+        run: |
+          if [ -z "$HEARTBEAT_URL" ]; then
+            echo "No LIVENESS_HEARTBEAT_URL secret: nothing outside GitHub watches this schedule."
+            exit 0
+          fi
+          # The URL goes in on stdin, not the command line, since it carries a token.
+          printf 'url = "%s"\n' "$HEARTBEAT_URL" \
+            | curl --config - -fsS --retry 3 --max-time 10 -o /dev/null
